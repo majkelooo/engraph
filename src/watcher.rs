@@ -17,6 +17,51 @@ use crate::profile::VaultProfile;
 use crate::serve::RecentWrites;
 use crate::store::Store;
 
+/// Guard proving this process owns vault indexing. Holds the locked file open;
+/// the kernel drops the `flock` when the descriptor closes, so a `SIGKILL` or a
+/// panic frees it too. A PID file would not: one hard kill and every later
+/// instance would refuse to index forever.
+pub struct WatcherLock {
+    _file: std::fs::File,
+}
+
+/// Try to become the single process that runs the watcher.
+///
+/// `Ok(None)` means another live instance already owns indexing — the normal
+/// outcome for the 2nd..Nth concurrent `engraph serve`, not a failure.
+///
+/// Only one watcher may run at a time: each holds a long-lived read-write
+/// connection and reindexes the whole vault on startup, so N watchers leave
+/// SQLite with no reader-free window and the WAL can never be checkpointed
+/// down. Four concurrent instances grew it to 2.8 GiB against a 245 MB database.
+pub fn try_acquire_watcher_lock(data_dir: &Path) -> anyhow::Result<Option<WatcherLock>> {
+    use anyhow::Context as _;
+    use std::os::unix::io::AsRawFd;
+
+    let path = data_dir.join("watcher.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open watcher lock at {}", path.display()))?;
+
+    // SAFETY: `file` owns a valid descriptor for the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(WatcherLock { _file: file }));
+    }
+
+    let err = std::io::Error::last_os_error();
+    // Matched by value, not by pattern: EWOULDBLOCK and EAGAIN are the same
+    // number on both macOS and Linux, and two identical patterns would be an
+    // unreachable arm under `-D warnings`.
+    match err.raw_os_error() {
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => Ok(None),
+        _ => Err(anyhow::Error::new(err).context(format!("failed to lock {}", path.display()))),
+    }
+}
+
 /// Start the file watcher and consumer. Returns a thread handle for the producer
 /// and a shutdown sender. On startup, runs a reconciliation index to catch any
 /// changes that occurred while the server was down, then begins watching for
@@ -684,4 +729,38 @@ pub async fn run_consumer(
     }
 
     tracing::info!("Watcher consumer shutting down (channel closed)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watcher_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = try_acquire_watcher_lock(dir.path()).unwrap();
+        assert!(first.is_some(), "first acquirer must win the election");
+
+        let second = try_acquire_watcher_lock(dir.path()).unwrap();
+        assert!(
+            second.is_none(),
+            "second acquirer must lose while the first guard is alive"
+        );
+    }
+
+    #[test]
+    fn watcher_lock_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = try_acquire_watcher_lock(dir.path()).unwrap();
+        assert!(first.is_some());
+        drop(first);
+
+        let after = try_acquire_watcher_lock(dir.path()).unwrap();
+        assert!(
+            after.is_some(),
+            "lock must be available again once the guard is dropped"
+        );
+    }
 }

@@ -1079,15 +1079,26 @@ pub async fn run_serve(
             exclude.push(pattern);
         }
     }
-    let (watcher_handle, watcher_shutdown) = crate::watcher::start_watcher(
-        store_arc.clone(),
-        embedder_arc.clone(),
-        vault_path_arc.clone(),
-        profile_arc.clone(),
-        config,
-        exclude,
-        recent_writes.clone(),
-    )?;
+    // Exactly one live instance may run the watcher — see try_acquire_watcher_lock
+    // for why N watchers keep the WAL from ever being checkpointed down.
+    let watcher = match crate::watcher::try_acquire_watcher_lock(data_dir)? {
+        Some(lock) => {
+            let (handle, shutdown) = crate::watcher::start_watcher(
+                store_arc.clone(),
+                embedder_arc.clone(),
+                vault_path_arc.clone(),
+                profile_arc.clone(),
+                config,
+                exclude,
+                recent_writes.clone(),
+            )?;
+            Some((handle, shutdown, lock))
+        }
+        None => {
+            eprintln!("Indexing owned by another engraph instance; watcher disabled");
+            None
+        }
+    };
 
     if read_only {
         eprintln!("Read-only mode: write tools disabled");
@@ -1158,9 +1169,14 @@ pub async fn run_serve(
     cancel_token.cancel(); // triggers HTTP graceful shutdown
 
     // Shut down watcher cleanly after MCP transport exits
-    let _ = watcher_shutdown.send(());
-    if let Err(e) = watcher_handle.join() {
-        tracing::warn!("Watcher thread panicked: {:?}", e);
+    if let Some((handle, shutdown, lock)) = watcher {
+        let _ = shutdown.send(());
+        if let Err(e) = handle.join() {
+            tracing::warn!("Watcher thread panicked: {:?}", e);
+        }
+        // Release indexing ownership only after the thread is gone, so the next
+        // instance to win the election cannot overlap with this one.
+        drop(lock);
     }
 
     Ok(())
